@@ -1,0 +1,140 @@
+import pandas as pd
+import os
+import requests
+import json
+import time
+
+COHORT_NUMBER = '43'
+NICKNAME = 'novodvorskiyp'
+KEY = '5f55e6c0-e9e5-4a9c-b313-63c01fc31460'
+
+generate_report_response = requests.post(
+    "https://d5dg1j9kt695d30blp03.apigw.yandexcloud.net/generate_report", # точка входа
+    headers={
+    "X-API-KEY": KEY, # ключ API
+    "X-Nickname": NICKNAME, # авторизационные данные
+    "X-Cohort": COHORT_NUMBER # авторизационные данные
+    }
+).json()
+
+time.sleep(60)
+
+task_id = generate_report_response["task_id"]
+
+get_report_response = requests.get(
+    f"https://d5dg1j9kt695d30blp03.apigw.yandexcloud.net/get_report?task_id={task_id}", 
+    headers={
+    "X-API-KEY": KEY,
+    "X-Nickname": NICKNAME,
+    "X-Cohort": COHORT_NUMBER
+    }
+).json()
+print(get_report_response)
+
+file_names = [
+    'customer_research',
+    'user_order_log',
+    'user_activity_log'
+]
+
+REPORT_ID = get_report_response['data']['report_id']
+
+for FILE_NAME in file_names:
+    response = requests.get(f'https://storage.yandexcloud.net/s3-sprint3/cohort_{COHORT_NUMBER}/{NICKNAME}/{REPORT_ID}/{FILE_NAME}.csv')
+    with open(f'/lessons/stage/{FILE_NAME}.csv','wb') as f:
+        f.write(response.content)
+
+import pandas as pd
+import psycopg2
+
+customer_research = pd.read_csv('C:/Users/Honor/Downloads/customer_research.csv', encoding='utf-8')
+user_activity_log = pd.read_csv('C:/Users/Honor/Downloads/user_activity_log.csv')
+user_order_log= pd.read_csv('C:/Users/Honor/Downloads/user_order_log.csv')
+
+conn = psycopg2.connect("host='localhost' port='15432' dbname='de' user='jovyan' password='jovyan'")
+# переменная conn создаёт подключение к БД
+cur = conn.cursor()  
+
+customer_research_creation = cur.execute('''CREATE TABLE IF NOT EXISTS stage.customer_research (
+    ID serial ,
+    date_id TIMESTAMP ,
+    category_id int ,
+    geo_id int ,
+    sales_qty int ,
+    sales_amt numeric ,
+    PRIMARY KEY (ID)
+)''')
+
+user_activity_log_creation = cur.execute('''CREATE TABLE IF NOT EXISTS stage.customer_research (
+    ID serial ,
+    date_id TIMESTAMP ,
+    category_id int ,
+    geo_id int ,
+    sales_qty int ,
+    sales_amt NUMERIC (14,2) ,
+    PRIMARY KEY (ID)
+)''')
+
+user_order_log_creation = cur.execute('''CREATE TABLE IF NOT EXISTS stage.user_order_log (
+    ID int,
+    date_time TIMESTAMP,
+    city_id int,
+    city_name varchar(100),
+    customer_id BIGINT,
+    first_name varchar(100),
+    last_name varchar(100),
+    item_id int,
+    item_name varchar(100),
+    quantity BIGINT,
+    payment_amount NUMERIC(14,2),
+    PRIMARY KEY (ID)
+    )''')
+
+for index, row in customer_research.iterrows():
+    cur.execute('''INSERT INTO stage.customer_research(
+        date_id ,
+        category_id ,
+        geo_id ,
+        sales_qty ,
+        sales_amt) 
+        VALUES (%s, %s, %s, %s, %s)''',(
+        row['date_id'],
+        row['category_id'],
+        row['geo_id'],
+        row['sales_qty'],
+        row['sales_amt'])
+        )
+
+for index, row in user_activity_log.iterrows():
+    cur.execute('''INSERT INTO stage.user_activity_log(
+        id,
+        date_time ,
+        action_id ,
+        customer_id ,
+        quantity 
+    ) VALUES (%s, %s, %s, %s, %s)''',(
+        row['id'],
+        row['date_time'],
+        row['action_id'],
+        row['customer_id'],
+        row['quantity'])
+        )
+
+for index, row in user_order_log.iterrows():
+    cur.execute('''INSERT INTO stage.user_order_log VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',(
+        row['id'],
+        row['date_time'],
+        row['city_id'],
+        row['city_name'],
+        row['customer_id'],
+        row['first_name'],
+        row['last_name'],
+        row['item_id'],
+        row['item_name'],
+        row['quantity'],
+        row['payment_amount'])
+        )
+conn.commit()
+
+cur.close()
+conn.close()
