@@ -39,17 +39,23 @@ file_names = [
 
 REPORT_ID = get_report_response['data']['report_id']
 
+path_pc = 'C:/Users/novodvorskiy_vd/Downloads/'
+path_container = '/lessons/stage/'
+
 for FILE_NAME in file_names:
     response = requests.get(f'https://storage.yandexcloud.net/s3-sprint3/cohort_{COHORT_NUMBER}/{NICKNAME}/{REPORT_ID}/{FILE_NAME}.csv')
-    with open(f'/lessons/stage/{FILE_NAME}.csv','wb') as f:
+    with open(f'{path_pc}{FILE_NAME}.csv','wb') as f:
         f.write(response.content)
 
 import pandas as pd
 import psycopg2
 
-customer_research = pd.read_csv('C:/Users/Honor/Downloads/customer_research.csv', encoding='utf-8')
-user_activity_log = pd.read_csv('C:/Users/Honor/Downloads/user_activity_log.csv')
-user_order_log= pd.read_csv('C:/Users/Honor/Downloads/user_order_log.csv')
+path_pc = 'C:/Users/novodvorskiy_vd/Downloads/'
+path_container = '/lessons/stage/'
+
+customer_research = pd.read_csv(f'{path_pc}customer_research.csv')
+user_activity_log = pd.read_csv(f'{path_pc}user_activity_log.csv')
+user_order_log= pd.read_csv(f'{path_pc}user_order_log.csv')
 
 conn = psycopg2.connect("host='localhost' port='15432' dbname='de' user='jovyan' password='jovyan'")
 # переменная conn создаёт подключение к БД
