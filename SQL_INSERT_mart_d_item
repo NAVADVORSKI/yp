@@ -1,0 +1,11 @@
+with items_inserting as (
+	select 
+		distinct item_id,
+		item_name
+	from stage.user_order_log uol 
+)
+insert into mart.d_item (
+	select 
+		*
+	from items_inserting 
+)
