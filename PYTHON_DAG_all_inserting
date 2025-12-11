@@ -1,0 +1,402 @@
+import datetime
+import time
+import psycopg2
+import requests
+import json
+import pandas as pd
+import numpy as np
+
+from airflow import DAG
+from airflow.providers.http.operators.http import SimpleHttpOperator
+from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
+from airflow.models.xcom import XCom
+
+### API settings ###
+api_conn = BaseHook.get_connection('create_files_api')
+api_endpoint = api_conn.host
+api_token = api_conn.password
+
+# Установка констант для API
+nickname = 'novodvorskiyp'
+cohort = '43'
+
+headers = {
+    "X-API-KEY": api_conn.password,
+    "X-Nickname": nickname,
+    "X-Cohort": cohort
+}
+
+### PostgreSQL settings ###
+psql_conn = BaseHook.get_connection('pg_connection')
+
+def create_files_request(ti):
+    """Запрос выгрузки файлов"""
+    method_url = '/generate_report'
+    r = requests.post(f'https://{api_endpoint}{method_url}', 
+                     headers=headers, 
+                     timeout=30)
+    r.raise_for_status()
+    response_dict = r.json()
+    task_id = response_dict['task_id']
+    ti.xcom_push(key='task_id', value=task_id)
+    print(f"task_id is {task_id}")
+    return task_id
+
+def check_report(ti):
+    """Проверка готовности файлов"""
+    task_id = ti.xcom_pull(task_ids='create_files_request', key='task_id')
+    
+    method_url = '/get_report'
+    payload = {'task_id': task_id}
+    
+    report_id = None
+    max_attempts = 4
+    wait_time = 70
+    
+    for attempt in range(max_attempts):
+        time.sleep(wait_time)
+        r = requests.get(f'https://{api_endpoint}{method_url}', 
+                        params=payload, 
+                        headers=headers,
+                        timeout=30)
+        r.raise_for_status()
+        response_dict = r.json()
+        
+        print(f"Attempt {attempt + 1}: Status = {response_dict['status']}")
+        
+        if response_dict['status'] == 'SUCCESS':
+            report_id = response_dict['data']['report_id']
+            break
+        elif response_dict['status'] == 'FAILURE':
+            raise Exception(f"Report generation failed: {response_dict}")
+    
+    if not report_id:
+        raise Exception("Report not ready after maximum attempts")
+    
+    ti.xcom_push(key='report_id', value=report_id)
+    print(f"report_id is {report_id}")
+    return report_id
+
+def upload_from_s3_to_pg(ti):
+    """Загрузка файлов в PostgreSQL"""
+    report_id = ti.xcom_pull(task_ids='check_ready_report', key='report_id')
+    
+    storage_url = f'https://storage.yandexcloud.net/s3-sprint3/cohort_{cohort}/{nickname}/{report_id}/{{FILE_NAME}}'
+    
+    # Установка соединения с БД
+    psql_conn = BaseHook.get_connection('pg_connection')
+    conn = psycopg2.connect(
+        dbname='de',
+        port=psql_conn.port,
+        user=psql_conn.login,
+        host=psql_conn.host,
+        password=psql_conn.password
+    )
+    cur = conn.cursor()
+    
+    # Функция для пакетной вставки
+    def batch_insert(df, table_name, columns, batch_size=1000):
+        total_rows = len(df)
+        for i in range(0, total_rows, batch_size):
+            batch = df.iloc[i:i + batch_size]
+            if not batch.empty:
+                # Генерация плейсхолдеров
+                placeholders = ','.join(['%s'] * len(columns))
+                query = f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})"
+                
+                # Конвертация в список кортежей
+                values = [tuple(row) for row in batch.itertuples(index=False, name=None)]
+                
+                # Массовая вставка
+                psycopg2.extras.execute_batch(cur, query, values)
+                conn.commit()
+                print(f'{table_name}: Inserted {min(i+batch_size, total_rows)}/{total_rows} rows', end='\r')
+    
+    try:
+        # Загрузка customer_research
+        print("Loading customer_research...")
+        df_cr = pd.read_csv(storage_url.replace("{FILE_NAME}", "customer_research.csv"))
+        batch_insert(df_cr, 'stage.customer_research', 
+                    ['date_id', 'category_id', 'geo_id', 'sales_qty', 'sales_amt'])
+        
+        # Загрузка user_order_log
+        print("\nLoading user_order_log...")
+        df_uol = pd.read_csv(storage_url.replace("{FILE_NAME}", "user_order_log.csv"))
+        df_uol = df_uol.drop(columns=['id'], errors='ignore')
+        batch_insert(df_uol, 'stage.user_order_log',
+                    ['date_time', 'city_id', 'city_name', 'customer_id', 
+                     'first_name', 'last_name', 'item_id', 'item_name', 
+                     'quantity', 'payment_amount'])
+        
+        # Загрузка user_activity_log
+        print("\nLoading user_activity_log...")
+        df_ual = pd.read_csv(storage_url.replace("{FILE_NAME}", "user_activity_log.csv"))
+        df_ual = df_ual.drop(columns=['id'], errors='ignore')
+        batch_insert(df_ual, 'stage.user_activity_log',
+                    ['date_time', 'action_id', 'customer_id', 'quantity'])
+        
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+    
+    return 200
+
+def update_mart_d_tables(ti):
+    """Обновление таблиц dimension"""
+    psql_conn = BaseHook.get_connection('pg_connection')
+    conn = psycopg2.connect(
+        dbname='de',
+        port=psql_conn.port,
+        user=psql_conn.login,
+        host=psql_conn.host,
+        password=psql_conn.password
+    )
+    cur = conn.cursor()
+    
+    try:
+        # Очистка и обновление таблиц d
+        queries = [
+            # Очистка таблиц
+            "TRUNCATE TABLE mart.d_calendar RESTART IDENTITY CASCADE;",
+            "TRUNCATE TABLE mart.d_customer RESTART IDENTITY CASCADE;",
+            "TRUNCATE TABLE mart.d_item RESTART IDENTITY CASCADE;",
+            
+            # Обновление d_calendar
+            """
+                    with 
+                    dates as (
+                        select max(date_id) date 
+                        from stage.customer_research
+                        union
+                        select min(date_id) date 
+                        from stage.customer_research
+                        union 
+                        select max(date_time) date 
+                        from stage.user_activity_log
+                        union
+                        select min(date_time) date 
+                        from stage.user_activity_log
+                        union 
+                        select max(date_time) date 
+                        from stage.user_order_log
+                        union
+                        select min(date_time) date 
+                        from stage.user_order_log
+                    ),
+                    calendar_table as (
+                    select 
+                        row_number() over () id,
+                        date::date fact_date,
+                        extract(day from date) day_num,
+                        extract(month from date) month_mum,
+                        case
+                            when EXTRACT(month FROM date) = 1 then 'Январь'
+                            when EXTRACT(month FROM date) = 2 then 'Февраль'
+                            when EXTRACT(month FROM date) = 3 then 'Март'
+                            when EXTRACT(month FROM date) = 4 then 'Апрель'
+                            when EXTRACT(month FROM date) = 5 then 'Май'
+                            when EXTRACT(month FROM date) = 6 then 'Июнь'
+                            when EXTRACT(month FROM date) = 7 then 'Июль'
+                            when EXTRACT(month FROM date) = 8 then 'Август'
+                            when EXTRACT(month FROM date) = 9 then 'Сентябрь'
+                            when EXTRACT(month FROM date) = 10 then 'Октябрь'
+                            when EXTRACT(month FROM date) = 11 then 'Ноябрь'
+                            when EXTRACT(month FROM date) = 12 then 'Декабрь'
+                            else 'Н/Д'
+                        end as month_name,
+                        extract (year from date) year_num
+                    from generate_series(
+                        (select 
+                            min(date)
+                        from dates)::timestamp,
+                        (select 
+                            max(date)
+                        from dates)::timestamp,
+                        '1 day'::interval
+                    ) as date
+                    )
+                    insert into mart.d_calendar (
+                        select 
+                            *
+                        from calendar_table 
+                    )
+            """,
+            
+            # Обновление d_customer
+            """
+                    with customers_inserting as (
+                        select 
+                            customer_id,
+                            first_name,
+                            last_name,
+                            max(city_id) city_id
+                        from stage.user_order_log uol 
+                        group by
+                            customer_id,
+                            first_name,
+                            last_name
+                    )
+                    insert into mart.d_customer (
+                        select 
+                            *
+                        from customers_inserting
+                    )
+            """,
+            
+            # Обновление d_item
+            """
+                    with items_inserting as (
+                        select 
+                            distinct item_id,
+                            item_name
+                        from stage.user_order_log uol 
+                    )
+                    insert into mart.d_item (
+                        select 
+                            *
+                        from items_inserting 
+                    )
+            """
+        ]
+        
+        for query in queries:
+            cur.execute(query)
+            conn.commit()
+        
+        print("Mart D tables updated successfully!")
+        
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
+def update_mart_f_tables(ti):
+    """Обновление таблиц fact"""
+    psql_conn = BaseHook.get_connection('pg_connection')
+    conn = psycopg2.connect(
+        dbname='de',
+        port=psql_conn.port,
+        user=psql_conn.login,
+        host=psql_conn.host,
+        password=psql_conn.password
+    )
+    cur = conn.cursor()
+    
+    try:
+        # Очистка и обновление таблиц f
+        queries = [
+            # Очистка таблиц
+            "TRUNCATE TABLE mart.f_daily_sales RESTART IDENTITY CASCADE;",
+            "TRUNCATE TABLE mart.f_activity RESTART IDENTITY CASCADE;",
+            
+            # Обновление f_daily_sales
+            """
+                    with f_daily_sales_insert as (
+                        select 
+                            dc.date_id,
+                            uol.item_id ,
+                            uol.customer_id ,
+                            sum(case 
+                                when uol.quantity = 0 or uol.quantity is null then 0
+                                else uol.payment_amount / uol.quantity 
+                            end) as price,
+                            sum(uol.quantity) quantity ,
+                            sum(uol.payment_amount) payment_amount 
+                        from stage.user_order_log uol 
+                        left join stage.user_activity_log ual 
+                        on uol.date_time = ual.date_time
+                        and uol.customer_id = ual.customer_id
+                        left join mart.d_calendar dc 
+                        on uol.date_time::date = dc.fact_date::date
+                        group by 
+                            dc.date_id,
+                            uol.item_id ,
+                            uol.customer_id
+                    )
+                    insert into mart.f_daily_sales (
+                        select * from f_daily_sales_insert 
+                    )
+            """,
+            """
+                    delete from mart.f_activity;
+                    with f_activity_insert as (
+                        select 
+                            ual.action_id activity_id,
+                            dc.date_id date_id
+                        from mart.d_calendar dc 
+                        inner join 
+                            (select 
+                                distinct date_time::date,
+                                action_id
+                            from stage.user_activity_log) ual  
+                        on ual.date_time = dc.fact_date 
+                    )
+                    insert into mart.f_activity (activity_id, date_id) (
+                        select * from f_activity_insert 
+                    )
+"""
+        ]
+        
+        for query in queries:
+            cur.execute(query)
+            conn.commit()
+        
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
+# Объявление DAG
+dag = DAG(
+    dag_id='591_full_dag',
+    schedule_interval='0 0 * * *',
+    start_date=datetime.datetime(2021, 1, 1),
+    catchup=False,
+    dagrun_timeout=datetime.timedelta(minutes=60),
+    default_args={
+        'retries': 2,
+        'retry_delay': datetime.timedelta(minutes=5)
+    }
+)
+
+# Определение задач
+t_file_request = PythonOperator(
+    task_id='create_files_request',
+    python_callable=create_files_request,
+    dag=dag
+)
+
+t_check_report = PythonOperator(
+    task_id='check_ready_report',
+    python_callable=check_report,
+    dag=dag
+)
+
+t_upload_from_s3_to_pg = PythonOperator(
+    task_id='upload_from_s3_to_pg',
+    python_callable=upload_from_s3_to_pg,
+    dag=dag
+)
+
+t_update_mart_d_tables = PythonOperator(
+    task_id='update_mart_d_tables',
+    python_callable=update_mart_d_tables,
+    dag=dag
+)
+
+t_update_mart_f_tables = PythonOperator(
+    task_id='update_mart_f_tables',
+    python_callable=update_mart_f_tables,
+    dag=dag
+)
+
+# Определение зависимостей
+t_file_request >> t_check_report >> t_upload_from_s3_to_pg >> [t_update_mart_d_tables, t_update_mart_f_tables]
