@@ -1,0 +1,17 @@
+with customers_inserting as (
+	select 
+		customer_id,
+		first_name,
+		last_name,
+		max(city_id) city_id
+	from stage.user_order_log uol 
+	group by
+		customer_id,
+		first_name,
+		last_name
+)
+insert into mart.d_customer (
+	select 
+		*
+	from customers_inserting
+)
