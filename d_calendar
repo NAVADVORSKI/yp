@@ -1,0 +1,57 @@
+with 
+dates as (
+	select max(date_id) date 
+	from stage.customer_research
+	union
+	select min(date_id) date 
+	from stage.customer_research
+	union 
+	select max(date_time) date 
+	from stage.user_activity_log
+	union
+	select min(date_time) date 
+	from stage.user_activity_log
+	union 
+	select max(date_time) date 
+	from stage.user_order_log
+	union
+	select min(date_time) date 
+	from stage.user_order_log
+),
+calendar_table as (
+select 
+	row_number() over () id,
+	date::date fact_date,
+	extract(day from date) day_num,
+	extract(month from date) month_mum,
+	case
+		when EXTRACT(month FROM date) = 1 then 'Январь'
+       	when EXTRACT(month FROM date) = 2 then 'Февраль'
+       	when EXTRACT(month FROM date) = 3 then 'Март'
+       	when EXTRACT(month FROM date) = 4 then 'Апрель'
+       	when EXTRACT(month FROM date) = 5 then 'Май'
+       	when EXTRACT(month FROM date) = 6 then 'Июнь'
+       	when EXTRACT(month FROM date) = 7 then 'Июль'
+       	when EXTRACT(month FROM date) = 8 then 'Август'
+       	when EXTRACT(month FROM date) = 9 then 'Сентябрь'
+       	when EXTRACT(month FROM date) = 10 then 'Октябрь'
+       	when EXTRACT(month FROM date) = 11 then 'Ноябрь'
+       	when EXTRACT(month FROM date) = 12 then 'Декабрь'
+       	else 'Н/Д'
+	end as month_name,
+	extract (year from date) year_num
+from generate_series(
+	(select 
+		min(date)
+	from dates)::timestamp,
+	(select 
+		max(date)
+	from dates)::timestamp,
+	'1 day'::interval
+) as date
+)
+insert into mart.d_calendar (
+	select 
+		*
+	from calendar_table 
+)
