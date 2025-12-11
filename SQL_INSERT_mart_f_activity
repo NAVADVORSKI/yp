@@ -1,0 +1,16 @@
+delete from mart.f_activity;
+with f_activity_insert as (
+	select 
+		ual.action_id activity_id,
+		dc.date_id date_id
+	from mart.d_calendar dc 
+	inner join 
+		(select 
+			distinct date_time::date,
+			action_id
+		from stage.user_activity_log) ual  
+	on ual.date_time = dc.fact_date 
+)
+insert into mart.f_activity (activity_id, date_id) (
+	select * from f_activity_insert 
+)
