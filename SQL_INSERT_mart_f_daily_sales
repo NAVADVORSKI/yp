@@ -1,0 +1,27 @@
+delete from mart.f_daily_sales;
+with f_daily_sales_insert as (
+	select 
+		dc.date_id,
+		uol.item_id ,
+		uol.customer_id ,
+		sum(case 
+			when uol.quantity = 0 or uol.quantity is null then 0
+			else uol.payment_amount / uol.quantity 
+		end) as price,
+		sum(uol.quantity) quantity ,
+		sum(uol.payment_amount) payment_amount 
+	from stage.user_order_log uol 
+	left join stage.user_activity_log ual 
+	on uol.date_time = ual.date_time
+	and uol.customer_id = ual.customer_id
+	left join mart.d_calendar dc 
+	on uol.date_time::date = dc.fact_date::date
+	group by 
+		dc.date_id,
+		uol.item_id ,
+		uol.customer_id
+)
+insert into mart.f_daily_sales (
+	select * from f_daily_sales_insert 
+)
+
